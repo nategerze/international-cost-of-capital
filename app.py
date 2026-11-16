@@ -60,18 +60,35 @@ def read_spread(book):
             return float(row.iloc[idx+1])
     raise ValueError('BBB benchmark not found in workbook')
 
-def fetch_betas():
-    r=requests.get(BETAS_URL,headers=HEADERS,timeout=20);r.raise_for_status()
-    raw=pd.read_excel(io.BytesIO(r.content),header=None)
-    matches=raw.index[raw.iloc[:,0].astype(str).str.strip().eq('Industry Name')].tolist()
-    if not matches: raise ValueError('Industry Name header missing in live Damodaran file')
-    header=int(matches[0]);df=pd.read_excel(io.BytesIO(r.content),header=header)
-    df.columns=[str(c).strip() for c in df.columns]
-    out=df[['Industry Name','Unlevered beta']].copy()
-    out['Unlevered beta']=pd.to_numeric(out['Unlevered beta'],errors='coerce')
-    out=out.dropna().drop_duplicates('Industry Name')
-    if len(out)<20:raise ValueError('Unexpectedly few industry rows')
+def parse_live_betas(content):
+    """Locate the real header in any column, tolerating introductory rows."""
+    raw = pd.read_excel(io.BytesIO(content), header=None)
+    header_row = None
+    for i, row in raw.head(45).iterrows():
+        normalized = [re.sub(r"\s+", " ", str(v).strip()).casefold() for v in row]
+        if "industry name" in normalized and "unlevered beta" in normalized:
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError('Industry Name / Unlevered beta headers not found in downloaded file')
+    df = pd.read_excel(io.BytesIO(content), header=header_row)
+    df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
+    cols = {c.casefold(): c for c in df.columns}
+    out = df[[cols['industry name'], cols['unlevered beta']]].copy()
+    out.columns = ['Industry Name', 'Unlevered beta']
+    out['Unlevered beta'] = pd.to_numeric(out['Unlevered beta'], errors='coerce')
+    out['Industry Name'] = out['Industry Name'].astype(str).str.strip()
+    out = out.dropna().query('`Unlevered beta` >= 0')
+    out = out[~out['Industry Name'].str.casefold().isin(['nan', 'total market', 'total market (without financials)'])]
+    out = out.drop_duplicates('Industry Name')
+    if len(out) < 20:
+        raise ValueError('Unexpectedly few industry rows in live file')
     return out.sort_values('Industry Name')
+
+def fetch_betas():
+    r = requests.get(BETAS_URL, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    return parse_live_betas(r.content)
 
 def fetch_spread():
     r=requests.get(SPREAD_URL,headers=HEADERS,timeout=20);r.raise_for_status()
@@ -85,31 +102,60 @@ def fetch_spread():
                 if m:return float(m.group(1))/100
     raise ValueError('Could not identify BBB spread in current ratings page')
 
-def fetch_bonds():
-    """Best-effort scrape of public HTML table; never fabricate yields."""
-    r=requests.get(BONDS_URL,headers=HEADERS,timeout=25);r.raise_for_status()
-    soup=BeautifulSoup(r.text,'html.parser')
-    results={}
-    # Trading Economics bond listing typically has a 'Yield' column and a
-    # country/bond column; parse table headers rather than fixed positions.
+def parse_bond_html(html):
+    """Read the public bonds listing, tolerating absent thead and alternate headings.
+
+    Only accept rows explicitly identified as 10-year bonds or rows in the
+    Trading Economics /bonds 10-year benchmark table. Never guess yields.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    results = {}
+    aliases = {'US': 'United States', 'USA': 'United States', 'UK': 'United Kingdom',
+               'South Korea': 'South Korea', 'Korea': 'South Korea',
+               'Czechia': 'Czech Republic', 'Turkey': 'Türkiye'}
+    canonical = {c.casefold(): c for c in COUNTRIES}
+    for alias, target in aliases.items():
+        canonical[alias.casefold()] = target
     for table in soup.find_all('table'):
-        heads=[x.get_text(' ',strip=True).lower() for x in table.select('thead th')]
-        yield_idx=next((i for i,h in enumerate(heads) if h=='yield' or h.startswith('yield ')),None)
-        if yield_idx is None:continue
-        for tr in table.select('tbody tr'):
-            cells=[x.get_text(' ',strip=True) for x in tr.find_all(['td','th'],recursive=False)]
-            if len(cells)<=yield_idx:continue
-            label=cells[0]
-            if '10y' not in label.lower() and '10 year' not in label.lower() and '10-year' not in label.lower():
-                # TE /bonds page is itself a list of 10Y bonds; allow country-only rows.
-                pass
-            country=next((c for c in COUNTRIES if label.lower().startswith(c.lower())),None)
-            if not country:continue
-            m=re.search(r'-?\d+(?:\.\d+)?',cells[yield_idx].replace(',',''))
-            if m:
-                val=float(m.group())/100
-                if -0.1 < val < 0.5:results[country]=val
-    if len(results)<3:raise ValueError('Bond table unavailable or page structure changed; enter yields manually')
+        rows = table.find_all('tr')
+        if not rows:
+            continue
+        header_idx = None
+        yield_idx = None
+        for j, tr in enumerate(rows[:6]):
+            cells = [c.get_text(' ', strip=True).casefold() for c in tr.find_all(['th','td'], recursive=False)]
+            for k, cell in enumerate(cells):
+                if cell in ('yield', 'yield %', 'last', 'last price') or cell.startswith('yield '):
+                    yield_idx = k
+                    header_idx = j
+                    break
+            if yield_idx is not None:
+                break
+        if yield_idx is None:
+            continue
+        for tr in rows[header_idx+1:]:
+            cells = [c.get_text(' ', strip=True) for c in tr.find_all(['th','td'], recursive=False)]
+            if len(cells) <= yield_idx or not cells:
+                continue
+            label = cells[0].strip()
+            label = re.sub(r'\s+(?:10Y|10-Year|10 Year|Government Bond|Bond Yield|Bond)$', '', label, flags=re.I).strip()
+            country = canonical.get(label.casefold())
+            if not country:
+                continue
+            raw = cells[yield_idx].replace(',', '').replace('%','').strip()
+            if not re.fullmatch(r'[+-]?\d+(?:\.\d+)?', raw):
+                continue
+            value = float(raw) / 100
+            if -0.1 < value < 0.5:
+                results[country] = value
+    return results
+
+def fetch_bonds():
+    r = requests.get(BONDS_URL, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    results = parse_bond_html(r.text)
+    if len(results) < 3:
+        raise ValueError('No usable 10-year bond table in public HTML; Trading Economics may load quotes with JavaScript or block requests. Enter verified yields manually.')
     return results
 
 @st.cache_data(show_spinner=False)
@@ -188,8 +234,8 @@ with y2:
 if us_manual or foreign_manual:
     st.info('One or both bond yields are manually entered. The initial 4.0% field values are **illustrative placeholders**, not verified market observations. Replace them before using the result.')
 if country=='United States':
-    st.caption('United States selected: matching government yields are required for identical-currency comparisons.')
-    if not foreign_manual:foreign_y=us_y
+    st.caption('United States selected: using the same government yield for both columns.')
+    foreign_y=us_y
 
 foreign_override=st.checkbox('Override foreign-currency BBB spread',value=False)
 auto_spread=spread*(1+foreign_y)/(1+us_y)
