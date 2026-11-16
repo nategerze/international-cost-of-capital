@@ -37,6 +37,7 @@ def pct(x):
     return f'{100*x:.4f}%'
 
 from calculations import compute
+from data_sources import fetch_betas as fetch_verified_betas, fetch_country_bond
 
 def read_betas(book):
     df = pd.read_excel(book, sheet_name='Betas Industry Averages', header=9)
@@ -86,9 +87,7 @@ def parse_live_betas(content):
     return out.sort_values('Industry Name')
 
 def fetch_betas():
-    r = requests.get(BETAS_URL, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    return parse_live_betas(r.content)
+    return fetch_verified_betas()
 
 def fetch_spread():
     r=requests.get(SPREAD_URL,headers=HEADERS,timeout=20);r.raise_for_status()
@@ -166,8 +165,8 @@ def load_local():
 def load_live_betas():return fetch_betas()
 @st.cache_data(show_spinner=False)
 def load_live_spread():return fetch_spread()
-@st.cache_data(show_spinner=False)
-def load_live_bonds():return fetch_bonds()
+@st.cache_data(ttl=900,show_spinner=False)
+def load_country_bond(country):return fetch_country_bond(country)
 
 st.set_page_config(page_title='International Cost of Capital',layout='wide')
 st.title('International Cost of Capital')
@@ -177,7 +176,7 @@ if not BOOK.exists():st.error('source_data.xlsx is missing. Put the supplied wor
 with st.sidebar:
     st.header('Data and assumptions')
     if st.button('↻ Refresh live data',use_container_width=True):
-        load_live_betas.clear();load_live_spread.clear();load_live_bonds.clear()
+        load_live_betas.clear();load_live_spread.clear();load_country_bond.clear()
         st.rerun()
     use_live=st.checkbox('Attempt latest online data',value=True)
     st.caption('If a live source fails, the app labels the workbook fallback. Bond yields require a live quote or manual entry.')
@@ -189,13 +188,14 @@ provenance={'Industry betas':'Workbook (Damodaran; updated Jan 5, 2026)',
             'Bond yields':'Not loaded'}
 errors=[]
 if use_live:
-    try:betas=load_live_betas();provenance['Industry betas']='Live Damodaran file (fetched '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+')'
+    try:
+        betas,beta_url=load_live_betas();provenance['Industry betas']='Damodaran US sector betas: '+beta_url+' (retrieved '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+')'
     except Exception as e:errors.append('Industry betas: '+str(e))
     try:spread=load_live_spread();provenance['BBB USD spread']='Live Damodaran ratings page (fetched '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+')'
     except Exception as e:errors.append('BBB spread: '+str(e))
     # OECD rates are workbook-sourced; no unverified current rates substituted.
-    try:bonds=load_live_bonds();provenance['Bond yields']='Trading Economics public table (fetched '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+')'
-    except Exception as e:bonds={};errors.append('Bond yields: '+str(e))
+    bonds={}  # Country-specific quotes loaded after country selection.
+
 else:bonds={}
 if errors:
     with st.expander('Data retrieval notices',expanded=True):
@@ -207,6 +207,15 @@ left,right=st.columns(2)
 with left:
     industry=st.selectbox('Industry',names,index=names.index(default_industry))
     country=st.selectbox('Selected country',list(COUNTRIES),index=0)
+    if use_live:
+        for target in dict.fromkeys(['United States',country]):
+            try:
+                y,url=load_country_bond(target)
+                bonds[target]=y
+                provenance[f'{target} 10Y yield']=f'Trading Economics: {url} (retrieved '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')+')'
+            except Exception as exc:
+                errors.append(f'{target} bond yield: {exc}')
+                st.warning(f'{target} bond yield: {exc}. Enter a verified yield manually.')
     erp=st.number_input('Equity risk premium (%)',value=6.5,step=0.1)/100
     debt=st.slider('Target debt financing (%)',0.0,95.0,30.0,1.0)/100
     tax_choice=st.radio('Project tax rate for BOTH currencies',['United States','Selected country'],horizontal=True)
